@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import math
 import sqlite3
 import time
 from contextlib import closing
@@ -785,9 +786,25 @@ def observation_impact_preview(
         t_prev, bias_prev = prev["ts"], prev["bias"]
         t_next, bias_next = nxt["ts"], nxt["bias"]
     current_bias = calibration.interpolate(ts, t_prev, bias_prev, t_next, bias_next)
+    delta_candidate = bias - current_bias
     max_abs_change, max_change_at, exceedances = calibration.insertion_impact(
-        t_prev, ts, t_next, bias - current_bias, impact_limit
+        t_prev, ts, t_next, delta_candidate, impact_limit
     )
+    if (
+        not math.isfinite(current_bias)
+        or not math.isfinite(delta_candidate)
+        or not math.isfinite(max_abs_change)
+        or not math.isfinite(max_change_at)
+        or any(not math.isfinite(t) for pair in exceedances for t in pair)
+    ):
+        # 输入均为有限值，但极端量级下当前插值、变化量或阈值交点解析求根溢出
+        # （交点时刻可为 ±Infinity）：结果无法表示为有限的 UTC 时点，按输入
+        # 不可处理拒绝（422）。此时尚未执行任何写操作，且连接为 query_only，
+        # 预演保持只读。
+        raise calibration.CalibrationError(
+            "impact result overflows to a non-finite value "
+            "(candidate bias, current interpolation and threshold are too far apart)"
+        )
     return {
         "timestamp": ts,
         "timestamp_iso": epoch_to_iso(ts),

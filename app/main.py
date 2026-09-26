@@ -81,13 +81,19 @@ app = FastAPI(
 @app.exception_handler(RequestValidationError)
 async def request_validation_exception_handler(request: Request, exc: RequestValidationError):
     """422 校验错误处理器：结构与 FastAPI 默认 {"detail": [...]} 完全一致，
-    仅把无法被标准 JSON 序列化的回显输入（NaN/±Infinity 等非有限浮点）替换为
-    字符串占位，避免默认处理器因回显原始 NaN 而序列化成 500。"""
-    detail = exc.errors()
-    for err in detail:
-        value = err.get("input")
+    仅把无法被标准 JSON 序列化的回显输入（NaN/±Infinity 等非有限浮点，
+    含嵌套在 readings 数组中的元素）替换为字符串占位，避免默认处理器因
+    回显原始 NaN 而序列化成 500。"""
+    def _sanitize(value: object) -> object:
         if isinstance(value, float) and not math.isfinite(value):
-            err["input"] = str(value)
+            return str(value)
+        if isinstance(value, dict):
+            return {k: _sanitize(v) for k, v in value.items()}
+        if isinstance(value, (list, tuple)):
+            return [_sanitize(v) for v in value]
+        return value
+
+    detail = _sanitize(exc.errors())
     return JSONResponse(status_code=422, content=jsonable_encoder({"detail": detail}))
 
 

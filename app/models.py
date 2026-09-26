@@ -12,13 +12,24 @@ def epoch_to_iso(ts: float) -> str:
     return datetime.fromtimestamp(ts, tz=timezone.utc).isoformat()
 
 
+def _ensure_utc_date(ts: float) -> None:
+    """时点必须能转换为 UTC 日期：拒绝 NaN/±Infinity 及超出平台时间范围的值。"""
+    if not math.isfinite(ts):
+        raise ValueError("timestamp must be a finite number")
+    try:
+        datetime.fromtimestamp(ts, tz=timezone.utc)
+    except (OverflowError, OSError, ValueError) as exc:
+        # 极大（如 1e300）的有限时间戳虽为数字，但无法转换为任何 UTC 日期
+        raise ValueError("timestamp cannot be converted to a UTC date") from exc
+
+
 def parse_timestamp(value: Any) -> float:
     """接受 Unix 秒（数字或数字字符串）或 ISO 8601 字符串，统一为 Unix 秒。"""
     if isinstance(value, bool):
         raise ValueError("invalid timestamp")
     if isinstance(value, (int, float)):
-        return float(value)
-    if isinstance(value, str):
+        ts = float(value)
+    elif isinstance(value, str):
         text = value.strip()
         if text.endswith(("Z", "z")):
             text = text[:-1] + "+00:00"
@@ -26,13 +37,17 @@ def parse_timestamp(value: Any) -> float:
             dt = datetime.fromisoformat(text)
         except ValueError:
             try:
-                return float(text)
+                ts = float(text)
             except ValueError:
                 raise ValueError(f"unparseable timestamp: {value!r}") from None
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=timezone.utc)
-        return dt.timestamp()
-    raise ValueError(f"unsupported timestamp type: {type(value).__name__}")
+        else:
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            ts = dt.timestamp()
+    else:
+        raise ValueError(f"unsupported timestamp type: {type(value).__name__}")
+    _ensure_utc_date(ts)
+    return ts
 
 
 Timestamp = Annotated[float, BeforeValidator(parse_timestamp)]
@@ -41,13 +56,30 @@ Timestamp = Annotated[float, BeforeValidator(parse_timestamp)]
 # ---------- 请求 ----------
 
 class ObservationIn(BaseModel):
-    reference: float = Field(description="参考值（真值）")
-    tolerance: float = Field(ge=0, description="容差：读数偏离组中位数超过该值即判为异常")
-    readings: list[float] = Field(min_length=3, description="同一时点的读数，至少 3 次")
+    reference: float = Field(description="参考值（真值），必须为有限数值")
+    tolerance: float = Field(ge=0, description="容差：读数偏离组中位数超过该值即判为异常；必须为有限非负数")
+    readings: list[float] = Field(min_length=3, description="同一时点的读数，至少 3 次，均须为有限数值")
     timestamp: Timestamp = Field(
         default_factory=lambda: datetime.now(timezone.utc).timestamp(),
-        description="观测时点：Unix 秒或 ISO 8601，缺省为当前时间",
+        description="观测时点：Unix 秒或 ISO 8601，缺省为当前时间；须能转换为 UTC 日期",
     )
+
+    @field_validator("reference", "tolerance", mode="after")
+    @classmethod
+    def _scalar_must_be_finite(cls, value: float) -> float:
+        # 标量在 Pydantic 数值强转之后再校验：NaN 通过 ge=0 比较（结果恒为 False
+        # 之外的情形），±Infinity 则能越过 ge=0，必须在此显式拒绝。
+        if not math.isfinite(value):
+            raise ValueError("must be a finite number (NaN and Infinity are not allowed)")
+        return value
+
+    @field_validator("readings", mode="after")
+    @classmethod
+    def _readings_must_be_finite(cls, values: list[float]) -> list[float]:
+        for value in values:
+            if not math.isfinite(value):
+                raise ValueError("readings must all be finite numbers (NaN and Infinity are not allowed)")
+        return values
 
 
 class CorrectionIn(BaseModel):

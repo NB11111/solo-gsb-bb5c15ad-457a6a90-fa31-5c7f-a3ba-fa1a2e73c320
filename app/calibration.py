@@ -2,11 +2,40 @@
 from __future__ import annotations
 
 import math
-from statistics import median
 
 
 class CalibrationError(ValueError):
     """输入读数无法计算有效校准偏差时抛出。"""
+
+
+def _mean_same_sign(a: float, b: float) -> float:
+    """求两个同号（或其一为零）有限数的均值，且不发生上溢。
+
+    a+b 有限时直接 (a+b)/2，结果与 statistics.median 的偶数组中点计算
+    完全一致；a+b 会溢出（两数同号且幅值接近 float 上界）时改用
+    a/2 + b/2——两数同号时除以 2 后幅值减半，加法不再溢出。极大但
+    有限的同值读数（如两个 1e308）因此仍能得到 1e308，而不会被
+    (a+b)/2 误算成 ±Infinity。
+    """
+    if math.isfinite(a + b):
+        return (a + b) / 2.0
+    return a / 2.0 + b / 2.0
+
+
+def finite_median(values: list[float]) -> float:
+    """返回有限读数列表的中位数，偶数个读数时中点均值不会上溢。
+
+    statistics.median 对偶数个读数按 (a+b)/2 求中点；当 a、b 同为接近
+    float 上界的有限数时 a+b 溢出为 Infinity，会把本应有限的中位数
+    误算成 Infinity（进而把所有读数误判为异常）。此处仅在中点求和会
+    溢出时走 _mean_same_sign 的不溢出分支，其余情形与 statistics.median
+    完全一致。
+    """
+    values = sorted(values)
+    mid = len(values) // 2
+    if len(values) % 2:
+        return values[mid]
+    return _mean_same_sign(values[mid - 1], values[mid])
 
 
 def split_outliers(readings: list[float], tolerance: float) -> tuple[float, list[float], list[float]]:
@@ -14,7 +43,7 @@ def split_outliers(readings: list[float], tolerance: float) -> tuple[float, list
 
     返回 (组中位数, 有效读数, 异常读数)。
     """
-    group_median = median(readings)
+    group_median = finite_median(readings)
     inliers = [r for r in readings if abs(r - group_median) <= tolerance]
     outliers = [r for r in readings if abs(r - group_median) > tolerance]
     return group_median, inliers, outliers
@@ -33,7 +62,17 @@ def compute_bias(reference: float, tolerance: float, readings: list[float]) -> t
             "all readings deviate from the group median by more than the tolerance; "
             "cannot compute a calibration bias"
         )
-    bias = reference - median(inliers)
+    inlier_median = finite_median(inliers)
+    bias = reference - inlier_median
+    if not math.isfinite(bias):
+        # reference 与有效读数中位数均为有限值，但二者之差溢出（符号相反、
+        # 幅值接近 float 上界）：无穷偏差无法入库，按输入不可处理拒绝（422）。
+        raise CalibrationError(
+            "calibration bias overflows to a non-finite value "
+            "(reference and valid readings are too far apart)"
+        )
+    if not math.isfinite(group_median):
+        raise CalibrationError("group median is not finite")
     return bias, group_median, inliers, outliers
 
 
