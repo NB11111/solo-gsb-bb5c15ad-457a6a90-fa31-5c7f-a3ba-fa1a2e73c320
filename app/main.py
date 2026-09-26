@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import math
 from contextlib import asynccontextmanager
-from typing import Annotated
+from typing import Annotated, Any
 
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.encoders import jsonable_encoder
@@ -78,16 +78,33 @@ app = FastAPI(
 )
 
 
+def _sanitize_non_finite(value: Any) -> Any:
+    """递归把无法被标准 JSON 序列化的非有限浮点（NaN/±Infinity）替换为字符串占位。
+
+    校验错误的回显输入可能是标量，也可能是 readings 列表等嵌套结构，
+    逐层替换，保证 422 响应本身永远可以被标准 JSON 序列化。
+    """
+    if isinstance(value, float) and not math.isfinite(value):
+        return str(value)
+    if isinstance(value, list):
+        return [_sanitize_non_finite(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_sanitize_non_finite(item) for item in value)
+    if isinstance(value, dict):
+        return {key: _sanitize_non_finite(item) for key, item in value.items()}
+    return value
+
+
 @app.exception_handler(RequestValidationError)
 async def request_validation_exception_handler(request: Request, exc: RequestValidationError):
     """422 校验错误处理器：结构与 FastAPI 默认 {"detail": [...]} 完全一致，
-    仅把无法被标准 JSON 序列化的回显输入（NaN/±Infinity 等非有限浮点）替换为
-    字符串占位，避免默认处理器因回显原始 NaN 而序列化成 500。"""
+    仅把无法被标准 JSON 序列化的回显输入（NaN/±Infinity 等非有限浮点，含
+    readings 列表等嵌套结构中的元素）替换为字符串占位，避免默认处理器因
+    回显原始 NaN 而序列化成 500。"""
     detail = exc.errors()
     for err in detail:
-        value = err.get("input")
-        if isinstance(value, float) and not math.isfinite(value):
-            err["input"] = str(value)
+        if "input" in err:
+            err["input"] = _sanitize_non_finite(err["input"])
     return JSONResponse(status_code=422, content=jsonable_encoder({"detail": detail}))
 
 

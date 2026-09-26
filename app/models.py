@@ -5,7 +5,7 @@ import math
 from datetime import datetime, timezone
 from typing import Annotated, Any
 
-from pydantic import BaseModel, BeforeValidator, Field, field_validator
+from pydantic import BaseModel, BeforeValidator, Field, ValidationInfo, field_validator
 
 
 def epoch_to_iso(ts: float) -> str:
@@ -41,13 +41,44 @@ Timestamp = Annotated[float, BeforeValidator(parse_timestamp)]
 # ---------- 请求 ----------
 
 class ObservationIn(BaseModel):
-    reference: float = Field(description="参考值（真值）")
-    tolerance: float = Field(ge=0, description="容差：读数偏离组中位数超过该值即判为异常")
-    readings: list[float] = Field(min_length=3, description="同一时点的读数，至少 3 次")
+    reference: float = Field(description="参考值（真值，有限数值）")
+    tolerance: float = Field(ge=0, description="容差（有限非负数）：读数偏离组中位数超过该值即判为异常")
+    readings: list[float] = Field(min_length=3, description="同一时点的读数（均为有限数值），至少 3 次")
     timestamp: Timestamp = Field(
         default_factory=lambda: datetime.now(timezone.utc).timestamp(),
-        description="观测时点：Unix 秒或 ISO 8601，缺省为当前时间",
+        description="观测时点：Unix 秒或 ISO 8601（须为可转换为 UTC 日期的有限数值），缺省为当前时间",
     )
+
+    @field_validator("reference", "tolerance", mode="after")
+    @classmethod
+    def _validate_finite_scalar(cls, value: float, info: ValidationInfo) -> float:
+        # JSON 的 NaN/±Infinity（含 1e400 这类溢出字面量与 "nan"/"inf" 字符串）
+        # 经 float 转换后都不是有限数：NaN 入库会触发 NOT NULL 约束错误，
+        # ±Infinity 会让无穷值进入偏差计算与数据库，一律拒绝（422）
+        if not math.isfinite(value):
+            raise ValueError(f"{info.field_name} must be a finite number")
+        return value
+
+    @field_validator("readings", mode="after")
+    @classmethod
+    def _validate_finite_readings(cls, value: list[float]) -> list[float]:
+        if any(not math.isfinite(v) for v in value):
+            raise ValueError("readings must all be finite numbers")
+        return value
+
+    @field_validator("timestamp", mode="after")
+    @classmethod
+    def _validate_timestamp(cls, value: float) -> float:
+        # 时点不仅要有限，还须能转换为 UTC 日期：响应与区间/历史接口都会用
+        # epoch_to_iso 渲染该值，无法转换的极大有限值（如 1e300）入库后
+        # 必然在渲染阶段崩溃，故在入库前拒绝（422）
+        if not math.isfinite(value):
+            raise ValueError("timestamp must be a finite number")
+        try:
+            epoch_to_iso(value)
+        except (OverflowError, OSError, ValueError) as exc:
+            raise ValueError("timestamp cannot be represented as a UTC date") from exc
+        return value
 
 
 class CorrectionIn(BaseModel):

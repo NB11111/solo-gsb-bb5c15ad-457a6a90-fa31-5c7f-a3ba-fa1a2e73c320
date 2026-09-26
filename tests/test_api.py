@@ -1,6 +1,8 @@
 """端到端 API 测试：每个用例使用独立临时 SQLite 库。"""
 from __future__ import annotations
 
+import json
+import math
 import os
 
 import pytest
@@ -1153,5 +1155,194 @@ def test_impact_preview_is_read_only(client, clock):
         client.get("/observations").json(),
         client.get("/intervals").json(),
         client.get("/observations/1/revisions").json(),
+    )
+    assert after == before
+
+
+# ---------- 数值边界：NaN/±Infinity 与溢出 ----------
+
+NON_FINITE = [math.nan, math.inf, -math.inf]
+
+
+def post_raw(client, path, payload):
+    """以原始 JSON 文本发送 POST（json= 序列化器拒绝 NaN/±Infinity，需自行 dumps）。"""
+    return client.post(path, content=json.dumps(payload),
+                       headers={"Content-Type": "application/json"})
+
+
+def put_raw(client, path, payload):
+    return client.put(path, content=json.dumps(payload),
+                      headers={"Content-Type": "application/json"})
+
+
+def base_payload(**overrides):
+    payload = {"timestamp": 1000.0, "reference": 10.0, "tolerance": 0.5,
+               "readings": [9.0, 9.1, 8.9]}
+    payload.update(overrides)
+    return payload
+
+
+@pytest.mark.parametrize("bad", NON_FINITE)
+@pytest.mark.parametrize("field", ["reference", "tolerance"])
+def test_create_observation_rejects_non_finite_scalar(client, field, bad):
+    resp = post_raw(client, "/observations", base_payload(**{field: bad}))
+    assert resp.status_code == 422
+    assert resp.json()["detail"][0]["loc"][-1] == field
+    # 被拒绝的登记不得留下任何观测或区间
+    assert client.get("/observations").json() == []
+    assert client.get("/intervals").json() == []
+
+
+@pytest.mark.parametrize("bad", NON_FINITE)
+def test_create_observation_rejects_non_finite_reading(client, bad):
+    resp = post_raw(client, "/observations", base_payload(readings=[9.0, bad, 8.9]))
+    # 回显的 readings 列表含非有限值，422 响应本身仍必须是合法 JSON
+    assert resp.status_code == 422
+    assert resp.json()["detail"][0]["loc"][-1] == "readings"
+    assert client.get("/observations").json() == []
+    assert client.get("/intervals").json() == []
+
+
+@pytest.mark.parametrize("bad", NON_FINITE)
+def test_create_observation_rejects_non_finite_timestamp(client, bad):
+    resp = post_raw(client, "/observations", base_payload(timestamp=bad))
+    assert resp.status_code == 422
+    assert resp.json()["detail"][0]["loc"][-1] == "timestamp"
+    assert client.get("/observations").json() == []
+
+
+@pytest.mark.parametrize("bad", [1e300, -1e300, 253402300800.0])
+def test_create_observation_rejects_unconvertible_timestamp(client, bad):
+    # 有限但超出可表示范围的时点无法转换为 UTC 日期，同样拒绝
+    resp = post_raw(client, "/observations", base_payload(timestamp=bad))
+    assert resp.status_code == 422
+    assert resp.json()["detail"][0]["loc"][-1] == "timestamp"
+    assert client.get("/observations").json() == []
+
+
+@pytest.mark.parametrize("raw", ['"nan"', '"Infinity"', '"-inf"'])
+def test_create_observation_rejects_non_finite_string_scalars(client, raw):
+    resp = client.post(
+        "/observations",
+        content=f'{{"timestamp": 1000.0, "reference": {raw}, "tolerance": 0.5,'
+                f' "readings": [9.0, 9.1, 8.9]}}',
+        headers={"Content-Type": "application/json"},
+    )
+    assert resp.status_code == 422
+    assert resp.json()["detail"][0]["loc"][-1] == "reference"
+    assert client.get("/observations").json() == []
+
+
+def test_create_observation_rejects_overflowing_bias(client):
+    # 输入全部有限，但参考值与有效中位数异号且都接近浮点上限：偏差相减溢出
+    resp = post_raw(client, "/observations",
+                    base_payload(reference=1.7e308, readings=[-1.7e308] * 3))
+    assert resp.status_code == 422
+    assert "finite" in resp.json()["detail"]
+    assert client.get("/observations").json() == []
+    assert client.get("/intervals").json() == []
+
+
+def test_create_observation_accepts_huge_finite_identical_readings(client):
+    # 极大但有限的同值读数：中位数按防溢出形式计算，不得误判为全部异常
+    huge = 1.7e308
+    body = make_observation(client, 1000.0, huge, 0.5, [huge, huge, huge, huge])
+    assert body["group_median"] == huge
+    assert body["bias"] == 0.0
+    assert body["outliers"] == []
+    assert all(not r["is_outlier"] for r in body["readings"])
+
+
+def test_create_observation_accepts_latest_representable_date(client):
+    body = make_observation(client, 253402300799.0, 10.0, 0.5, [9.0, 9.1, 8.9])
+    assert body["timestamp_iso"].startswith("9999-12-31T23:59:59")
+
+
+@pytest.mark.parametrize("bad", NON_FINITE)
+def test_revise_observation_rejects_non_finite_inputs(two_points, bad):
+    before = (
+        two_points.get("/observations").json(),
+        two_points.get("/intervals").json(),
+        two_points.get("/observations/1/revisions").json(),
+    )
+    for field in ("reference", "tolerance", "timestamp", "readings"):
+        value = [9.0, bad, 8.9] if field == "readings" else bad
+        resp = put_raw(two_points, "/observations/1",
+                       base_payload(revision=1, **{field: value}))
+        assert resp.status_code == 422
+        assert resp.json()["detail"][0]["loc"][-1] == field
+    # 全部被拒后：观测、读数、区间与修订快照均无任何变化
+    after = (
+        two_points.get("/observations").json(),
+        two_points.get("/intervals").json(),
+        two_points.get("/observations/1/revisions").json(),
+    )
+    assert after == before
+
+
+def test_revise_observation_rejects_unconvertible_timestamp(two_points):
+    resp = put_raw(two_points, "/observations/1", base_payload(revision=1, timestamp=1e300))
+    assert resp.status_code == 422
+    obs = next(o for o in two_points.get("/observations").json() if o["id"] == 1)
+    assert obs["revision"] == 1                      # 版本未被推进
+    assert two_points.get("/observations/1/revisions").json() == []
+
+
+def test_revise_observation_rejects_overflowing_bias(two_points):
+    before = (
+        two_points.get("/observations").json(),
+        two_points.get("/intervals").json(),
+        two_points.get("/observations/1/revisions").json(),
+    )
+    resp = put_raw(two_points, "/observations/1",
+                   base_payload(revision=1, reference=1.7e308, readings=[-1.7e308] * 3))
+    assert resp.status_code == 422
+    after = (
+        two_points.get("/observations").json(),
+        two_points.get("/intervals").json(),
+        two_points.get("/observations/1/revisions").json(),
+    )
+    assert after == before
+
+
+@pytest.mark.parametrize("bad", NON_FINITE)
+def test_impact_preview_rejects_non_finite_inputs(two_points, bad):
+    before = (
+        two_points.get("/observations").json(),
+        two_points.get("/intervals").json(),
+        two_points.get("/observations/1/revisions").json(),
+    )
+    for field in ("reference", "tolerance", "timestamp", "readings"):
+        value = [6.0, bad, 5.9] if field == "readings" else bad
+        payload = base_payload(timestamp=1500.0, reference=10.0, tolerance=0.5,
+                               readings=[6.0, 6.1, 5.9], impact_limit=0.5)
+        payload[field] = value
+        resp = post_raw(two_points, "/observation-impact-preview", payload)
+        assert resp.status_code == 422
+        assert resp.json()["detail"][0]["loc"][-1] == field
+    # 影响预演保持只读：被拒绝的预演同样不留任何变化
+    after = (
+        two_points.get("/observations").json(),
+        two_points.get("/intervals").json(),
+        two_points.get("/observations/1/revisions").json(),
+    )
+    assert after == before
+
+
+def test_impact_preview_rejects_unconvertible_timestamp_and_overflowing_bias(two_points):
+    before = (
+        two_points.get("/observations").json(),
+        two_points.get("/intervals").json(),
+        two_points.get("/observations/1/revisions").json(),
+    )
+    payload = base_payload(timestamp=1e300, readings=[6.0, 6.1, 5.9], impact_limit=0.5)
+    assert post_raw(two_points, "/observation-impact-preview", payload).status_code == 422
+    payload = base_payload(timestamp=1500.0, reference=1.7e308,
+                           readings=[-1.7e308] * 3, impact_limit=0.5)
+    assert post_raw(two_points, "/observation-impact-preview", payload).status_code == 422
+    after = (
+        two_points.get("/observations").json(),
+        two_points.get("/intervals").json(),
+        two_points.get("/observations/1/revisions").json(),
     )
     assert after == before

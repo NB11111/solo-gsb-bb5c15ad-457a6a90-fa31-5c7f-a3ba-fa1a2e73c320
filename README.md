@@ -8,7 +8,9 @@
 docker compose up --build
 ```
 
-- **API 地址：http://localhost:8000**
+一条命令构建并启动服务（Compose 把宿主 `8000` 端口映射到容器 `8000` 端口）：
+
+- **API 地址：http://localhost:8000**（宿主端口:容器端口 = `8000:8000`）
 - 交互式文档（Swagger UI）：http://localhost:8000/docs
 - 健康检查：http://localhost:8000/health
 
@@ -32,6 +34,7 @@ SQLite 数据落在命名卷 `calibration-data`（容器内 `/data/calibration.d
 14. **校正回执与密钥轮换**：`POST /correction-receipts` 复用 `/corrections` 的漂移补偿，并以键环当前活跃键签发 `version=2` 的 HMAC 回执：返回 `version`、`key_id`（签发密钥 ID）、归一化请求（`timestamp` 统一为 Unix 秒）、`bias`、`corrected`、`issued_at`（UTC Unix 毫秒整数）与 `receipt`。签名载荷按 `version`、`key_id`、`timestamp`、`reading`、`bias`、`corrected`、`issued_at` 顺序组成 JSON 数组，数值取 JSON 最短十进制、UTF-8 编码且无任何空白，以 `CORRECTION_RECEIPT_KEYS` 键环中 `key_id` 对应的密钥计算 HMAC-SHA256，输出小写十六进制。`POST /correction-receipts/verify` 接收完整回执，按 `key_id` **精确选键**重算签名并以**常量时间**比较：任一签名字段被改动、或 `key_id` 未知/已轮换出环均返回 `{"valid": false}`（旧键保留在环内时，轮换前签发的回执仍可验证）；结构缺失或类型错误返回 422。历史 `version=1` 回执继续按旧规则校验（密钥取自 `CORRECTION_RECEIPT_SECRET`，载荷不含 `key_id`）。键环在启动时校验：空键环、未知活跃键、非法 `key_id` 一律拒绝启动。
 15. **校准排期规划**：`POST /calibration-schedules/plan` 在 `[from, to]` 窗口内规划**数量最少**的新增校准时点。固定锚点取窗口两侧能覆盖边界的现有观测（`from` 之前最近一次、`to` 之后最近一次，恰落在边界上的观测自然入选）与窗口内全部观测；在禁排时段之外插入最少的新增时点，使所有相邻锚点（含新增时点）的间隔都不超过 `max_gap`。禁排时段先**规范化合并**（丢弃空区间、排序、合并重叠或端点相接的区间），合并后区间的**开区间内部**禁止排期、**边界允许排期**；多个最少方案并列时返回**字典序最早**的一组。响应含规范化后的禁排时段、固定锚点、建议时点与逐段间隔。请求**只读**，不改写观测、修订历史或区间表；缺少覆盖边界的现有锚点或约束无解返回 409，`from ≥ to`、`max_gap ≤ 0` 或禁排区间 `from > to` 返回 400。
 16. **校准曲线精简**：`POST /calibration-curves/simplify` 从当前观测（按时点排序）中**仅选择原观测的一个子序列**，首尾观测必须保留，使相邻保留点线性插值得到的精简曲线在完整覆盖范围内与原曲线的**绝对偏差逐原观测折点核对均不超过** `max_error`，并使**保留点数全局最少**（在可行弦 DAG 上做最短路）；保留点数并列时选择**时点序列字典序最早**者。每条候选弦的可行性都要逐一核对它跨越的**每个原观测折点**（不做固定步长采样，也不只查弦端点——端点偏差恒为 0）；全局实际最大误差同样由逐折点偏差取最大值得到（段内两条折线之差是线性函数，最大值必在折点），并列时取最早发生时点。响应返回保留点的 ID、时点、偏差（精简曲线经过原观测点，保留点偏差恒为 0），以及全局实际最大误差与其最早发生时点。请求**只读**，原观测、修订历史与区间表均不改写；`max_error` 必须是有限非负数（`0` 合法），否则返回 **422**；当前观测不足两条返回 **409**。
+17. **数值边界**：`POST /observations`、`PUT /observations/{id}` 与 `POST /observation-impact-preview` 共用的四个输入——`timestamp`、`reference`、`tolerance`、`readings`——必须是**有限数值**：`NaN`/`±Infinity`（含 `1e400` 这类溢出字面量与 `"nan"`/`"inf"` 字符串）一律返回 **422**（`NaN` 入库会触发数据库约束错误，`±Infinity` 会让无穷偏差污染插值区间）。`timestamp` 还须**能转换为 UTC 日期**：超出 `datetime` 可表示范围的极大有限值（如 `1e300`）同样返回 422。有限输入算出的偏差若**溢出浮点有限范围**（如参考值与有效中位数异号且都接近浮点上限）也返回 422。中位数按防溢出形式计算，极大但有限的同值读数（如 `1.7e308`）不会被误判为全部异常。被拒绝的登记/修订不留下任何观测、读数、区间或修订快照变化；影响预演始终只读。
 
 ## API 一览
 
@@ -58,6 +61,8 @@ SQLite 数据落在命名卷 `calibration-data`（容器内 `/data/calibration.d
 时间戳支持 Unix 秒（数字）或 ISO 8601 字符串（如 `2026-09-18T08:00:00Z`），缺省为服务器当前时间。
 
 ### 登记观测
+
+`timestamp`、`reference`、`tolerance`、`readings` 均须为**有限数值**（`NaN`/`±Infinity` 返回 422），`timestamp` 还须能转换为 UTC 日期；有限输入算出的偏差溢出浮点有限范围同样返回 422。被拒绝的请求不会留下任何数据变化（详见「校准规则」第 17 条）。
 
 ```bash
 curl -X POST http://localhost:8000/observations \
@@ -529,7 +534,7 @@ curl -X POST http://localhost:8000/calibration-curves/simplify \
 | 400 | 查询时点超出校准覆盖范围（响应含可用区间；历史补偿按重建后的覆盖范围判定）；积分/超限/稳定窗口 `from ≥ to` 或任一边界越界；超限阈值 `limit ≤ 0`；稳定窗口 `max_spread ≤ 0`；预算耗尽起点 `from` 越界或 `budget ≤ 0`；影响预演 `impact_limit ≤ 0`；排期规划 `from ≥ to`、`max_gap ≤ 0` 或禁排区间 `from > to` |
 | 404 | 修订/查询修订历史时观测 ID 不存在 |
 | 409 | 同一时点重复登记观测；修订时版本过期或目标时点已被占用；影响预演候选时点已占用或两侧无法形成邻点；排期规划缺少覆盖边界的现有锚点或禁排约束下无解；曲线精简时当前观测不足两条 |
-| 422 | 读数不足 3 次、全部读数被判异常、参数非法；曲线精简 `max_error` 非有限非负数/类型错误/缺失；回执校验请求结构缺失或字段类型错误（含 version=2 缺 `key_id`） |
+| 422 | 读数不足 3 次、全部读数被判异常、参数非法；观测登记/修订/影响预演的时点、参考值、容差或读数为 `NaN`/`±Infinity`、时点无法转换为 UTC 日期，或有限输入算出的偏差溢出浮点有限范围；曲线精简 `max_error` 非有限非负数/类型错误/缺失；回执校验请求结构缺失或字段类型错误（含 version=2 缺 `key_id`） |
 
 ## 本地开发
 

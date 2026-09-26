@@ -2,11 +2,29 @@
 from __future__ import annotations
 
 import math
-from statistics import median
 
 
 class CalibrationError(ValueError):
     """输入读数无法计算有效校准偏差时抛出。"""
+
+
+def _median(values: list[float]) -> float:
+    """序列中位数；偶数个时取中间两值的均值。
+
+    均值用防溢出形式计算：同号时 lo + (hi − lo)/2（增量 |hi − lo| 不溢出），
+    异号时 (lo + hi)/2（和的绝对值不超过任一操作数）。直接 (lo + hi)/2 在两个
+    同号极大有限值（如 1.7e308）上会溢出为无穷，把本有效的同值读数组误判为
+    全部异常。
+    """
+    ordered = sorted(values)
+    n = len(ordered)
+    mid = n // 2
+    if n % 2:
+        return ordered[mid]
+    lo, hi = ordered[mid - 1], ordered[mid]
+    if (lo < 0) == (hi < 0):
+        return lo + (hi - lo) / 2
+    return (lo + hi) / 2
 
 
 def split_outliers(readings: list[float], tolerance: float) -> tuple[float, list[float], list[float]]:
@@ -14,7 +32,7 @@ def split_outliers(readings: list[float], tolerance: float) -> tuple[float, list
 
     返回 (组中位数, 有效读数, 异常读数)。
     """
-    group_median = median(readings)
+    group_median = _median(readings)
     inliers = [r for r in readings if abs(r - group_median) <= tolerance]
     outliers = [r for r in readings if abs(r - group_median) > tolerance]
     return group_median, inliers, outliers
@@ -33,7 +51,14 @@ def compute_bias(reference: float, tolerance: float, readings: list[float]) -> t
             "all readings deviate from the group median by more than the tolerance; "
             "cannot compute a calibration bias"
         )
-    bias = reference - median(inliers)
+    bias = reference - _median(inliers)
+    if not math.isfinite(bias):
+        # 有限输入也可能算出无穷偏差（参考值与有效中位数异号且都接近浮点上限时
+        # 相减溢出）；无穷偏差一旦入库会污染插值区间与全部下游分析，按不可计算拒绝
+        raise CalibrationError(
+            "the calibration bias overflows the finite float range; "
+            "cannot compute a finite calibration bias"
+        )
     return bias, group_median, inliers, outliers
 
 
